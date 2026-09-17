@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# gdo: delegate a task to Gemini via the Antigravity CLI (agy) and print a compact report.
+# Claude Opus plans and reviews; Gemini executes. Full run logs go to ~/.cache/gdo/.
+#
+#   gdo "task"                  new task (task may also come on stdin)
+#   gdo -c <conversation_id> "answer to BLOCKED question / fix request"
+#   gdo -l                      list agy conversations for this dir (headless /resume)
+#   GDO_MODEL, GDO_EFFORT, GDO_TIMEOUT override defaults.
+set -uo pipefail
+
+model="${GDO_MODEL:-gemini-3.8-flash-high}"
+effort="${GDO_EFFORT:-high}"
+timeout="${GDO_TIMEOUT:-20m}"
+db="$HOME/.gemini/antigravity-cli/conversation_summaries.db"
+# agy stores workspaces as percent-encoded file:// URIs.
+uri=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote("file://"+sys.argv[1],safe="/:"))' "$PWD")
+if [ "${1:-}" = "-l" ]; then
+  sqlite3 -readonly -separator ' | ' "$db" "select conversation_id,title,step_count,substr(last_modified_time,1,16) from conversation_summaries where workspace_uris like '%\"$uri\"%' order by last_modified_time desc limit 20"
+  exit
+fi
+# Reuse the agy project already bound to this dir so runs show up under /resume there.
+project=$(sqlite3 -readonly "$db" "select project_id from conversation_summaries where workspace_uris like '%\"$uri\"%' and project_id!='default-cli-project' order by last_modified_time desc limit 1" 2>/dev/null)
+proj=(); [ -n "$project" ] && proj=(--project "$project")
+conv=()
+if [ "${1:-}" = "-c" ]; then conv=(--conversation "$2"); shift 2; fi
+
+task="${*:-$(cat)}"
+[ -z "$task" ] && { echo "gdo: empty task" >&2; exit 2; }
+
+contract='You are an executor subagent. An orchestrator (Claude Opus) planned this task and will review your work with git diff and by running checks.
+Rules:
+- Do exactly the task. No scope expansion, no unrelated refactors, no new dependencies unless the task says so.
+- Never git commit, push, or reset. Never delete files the task does not name.
+- If an interpretive decision is needed that the task does not settle, do NOT guess: stop and reply BLOCKED with the question and the options you see.
+- Shell: one simple command per tool call. No pipes, &&, ;, or > redirects (headless mode denies them and the run dies). Write files with the file tools, not shell.
+- Run the verification command if the task gives one. Run no other programs (no browsers, no installs, no exploratory tools) unless the task names them.
+Final reply, at most 15 lines:
+STATUS: DONE | BLOCKED | FAILED
+FILES: changed paths
+VERIFY: command and result
+NOTES: only what the orchestrator must know
+Plain text only: no markdown links, no file:// URLs.
+
+WORKING DIRECTORY (the project; all paths are relative to it, cd there first): __PWD__
+
+TASK:
+'
+contract="${contract/__PWD__/$PWD}"
+[ ${#conv[@]} -gt 0 ] && contract=''   # follow-ups reuse the conversation that already has the contract
+
+log="$HOME/.cache/gdo/$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$(dirname "$log")"
+
+# agy's workspace is NOT the shell cwd (it defaults to its own scratch dir), so pass the project in.
+agy -p "$contract$task" "${conv[@]}" "${proj[@]}" --add-dir "$PWD" --model "$model" --effort "$effort" \
+  --output-format json --print-timeout "$timeout" >"$log.json" 2>"$log.err"
+rc=$?
+
+status=$(jq -r '.status // "NO_JSON"' "$log.json" 2>/dev/null || echo NO_JSON)
+response=$(jq -r '.response // ""' "$log.json" 2>/dev/null)
+echo "gdo status=$status exit=$rc conversation=$(jq -r '.conversation_id // "-"' "$log.json" 2>/dev/null) log=$log"
+# Headless mode soft-denies unapproved tools and still reports SUCCESS; surface that.
+denied=$(grep -iE 'auto-denied|permission' "$log.err" | head -3)
+[ -n "$denied" ] && echo "DENIED: $denied"
+printf '%s\n' "$response"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git status --short | head -30
+
+[ "$status" = SUCCESS ] && [ $rc -eq 0 ] && [ -z "$denied" ] && [ -n "$response" ] || exit 1

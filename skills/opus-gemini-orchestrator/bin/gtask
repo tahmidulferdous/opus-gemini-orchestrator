@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# gtask: run one plan task entirely on Gemini, so the orchestrator (Opus) spends almost no tokens.
+#   implement (Gemini) -> run tests (script) -> review (fresh Gemini) -> fix loop (Gemini) -> summary
+#
+#   gtask .orchestrate/task-1.md          brief written by Opus
+#   GTASK_ROUNDS=2                        max Gemini fix rounds before handing back to Opus
+#
+# The brief must contain a "Files: <paths>" line (the only files the task may touch) and a
+# "Verify: <shell command>" line (the tests). Full artifacts land next to the brief:
+# <name>.report.md, <name>.review.md, <name>.tests.txt, <name>.diff. Only a short summary is printed.
+set -uo pipefail
+
+brief="${1:?usage: gtask <brief.md>}"
+[ -f "$brief" ] || { echo "gtask: no brief at $brief"; exit 2; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "gtask: not a git repo (git init first)"; exit 2; }
+
+rounds="${GTASK_ROUNDS:-2}"
+name="$(basename "$brief" .md)"
+dir="$(dirname "$brief")"
+files=$(sed -n 's/^Files:[[:space:]]*//p' "$brief" | head -1)
+verify=$(sed -n 's/^Verify:[[:space:]]*//p' "$brief" | head -1)
+[ -n "$files" ] && [ -n "$verify" ] || { echo "gtask: brief needs 'Files:' and 'Verify:' lines"; exit 2; }
+read -ra filearr <<<"$files"
+report="$dir/$name.report.md" review="$dir/$name.review.md" tests="$dir/$name.tests.txt" pkg="$dir/$name.diff"
+
+# Snapshot the working tree as a git tree object via a throwaway index: no commits, real index untouched.
+snap() {
+  local idx; idx="$(mktemp -u)"
+  GIT_INDEX_FILE="$idx" git add -A -- . ':(exclude).orchestrate' >/dev/null 2>&1
+  GIT_INDEX_FILE="$idx" git write-tree
+  rm -f "$idx"
+}
+conv_of() { sed -n 's/.*conversation=\([^ ]*\).*/\1/p' <<<"$1" | head -1; }
+summary() {
+  echo "gtask $name: $1 rounds=$round tests_exit=${tc:--} implementer=${impl:--}"
+  [ -f "$pkg" ] && git diff --stat "$base" "$(snap)" -- "${filearr[@]}" | tail -n 8
+  [ -f "$tests" ] && { echo "tests (tail):"; tail -n 5 "$tests"; }
+  [ -f "$review" ] && grep -E '^\[(Critical|Important)\]' "$review" | head -10
+  echo "artifacts: $report $review $tests $pkg"
+}
+
+base=$(snap)
+round=0 tc='' impl=''
+
+out=$(gdo "Read the task brief at $brief first; it is your complete requirements. Touch only these files: $files. Other workers may be editing other files at the same time; ignore them. When done, write a full report (what you built, decisions, how you tested) to $report, then give the short final reply.")
+impl=$(conv_of "$out")
+# Mechanical recovery: a soft-denied tool kills the run; resume once, steering around it.
+if [ -n "$impl" ] && grep -q '^DENIED:' <<<"$out"; then
+  out=$(gdo -c "$impl" "Your last tool call was denied by permissions and stopped the run. Do not retry it or anything similar. Continue the task using only the file tools and the Verify command from the brief, write the report, then give the short final reply.")
+fi
+if [ -z "$impl" ] || ! grep -q 'STATUS: DONE' <<<"$out"; then
+  summary "IMPLEMENTER_NOT_DONE"; grep -E '^(STATUS|NOTES|DENIED)' <<<"$out" | head -6; exit 1
+fi
+
+while :; do
+  bash -c "$verify" >"$tests" 2>&1; tc=$?
+  git diff "$base" "$(snap)" -- "${filearr[@]}" >"$pkg"
+  rm -f "$review"
+  gdo "You are a read-only code reviewer. Modify no file except $review. Read: the task brief $brief, the implementer report $report, the diff $pkg, and the test output $tests (the test command exited $tc). Check spec compliance (every requirement in the brief met, nothing extra built) and quality (correctness bugs, unhandled edge cases, tests that assert nothing or do not cover the brief). Write $review: first line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then one finding per line as '[Critical] file:line - problem - fix' (or [Important] / [Minor]). PASS only if the test command exited 0 and there are no Critical or Important findings." >/dev/null
+  verdict=$(head -1 "$review" 2>/dev/null)
+  [ "$verdict" = "VERDICT: PASS" ] && { summary "PASS"; exit 0; }
+  [ "$round" -ge "$rounds" ] && { summary "FAIL (${verdict:-no review written})"; exit 1; }
+  round=$((round + 1))
+  gdo -c "$impl" "Review round $round failed. Findings: $review. Test output: $tests (exit $tc). Fix every Critical and Important finding and any test failure, touching only $files. Append a fix report to $report." >/dev/null
+done
