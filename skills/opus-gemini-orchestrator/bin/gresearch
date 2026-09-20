@@ -16,7 +16,31 @@ report=$(sed -n 's/^Report:[[:space:]]*//p' "$brief" | head -1)
 [ -n "$report" ] || { echo "gresearch: brief needs a 'Report: <path.md>' line"; exit 2; }
 rounds="${GRESEARCH_ROUNDS:-2}"
 check="${report%.md}.factcheck.md"
+name="$(basename "$brief" .md)"
 mkdir -p "$(dirname "$report")"
+
+STATUS_DIR="${GDO_STATUS_DIR-${GDO_LOG_DIR:-$HOME/.cache/gdo}/status}"
+if [ -n "$STATUS_DIR" ] && [ -d "$STATUS_DIR" ]; then
+  now="$(date +%s)"
+  for f in "$STATUS_DIR"/*.status; do   # drop records older than a day
+    [ -f "$f" ] || continue
+    u=$(cut -d'|' -f5 "$f" 2>/dev/null || true)
+    [[ "$u" =~ ^[0-9]+$ ]] && [ $(( now - u )) -gt 86400 ] && rm -f "$f"
+  done
+fi
+[ -n "$STATUS_DIR" ] && mkdir -p "$STATUS_DIR"
+
+start_epoch=$(date +%s)
+gtokens=0
+res=''
+
+mark() {   # mark <phase> <state>; Gemini reports no cost, so the cost field stays 0
+  [ -n "$STATUS_DIR" ] || return 0
+  local tmp; tmp="$(mktemp "$STATUS_DIR/.$name.status.tmp.XXXXXX")"
+  printf '%s|%s|%s|%s|%s|%s|0|%s\n' "$name" "$1" "$2" "$start_epoch" "$(date +%s)" "$gtokens" "$res" >"$tmp"
+  mv -f "$tmp" "$STATUS_DIR/$name.status"
+}
+tally() { local t; t=$(sed -n 's/.*tokens=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1); [ -n "$t" ] && gtokens=$((gtokens + t)); }
 
 conv_of() { sed -n 's/.*conversation=\([^ ]*\).*/\1/p' <<<"$1" | head -1; }
 summary() {
@@ -27,22 +51,34 @@ summary() {
   echo "artifacts: $report $check"
 }
 
-round=0 res=''
-out=$(gdo "You are a research agent. Read the research brief at $brief first; it is your complete requirements. Use your web search and URL reading tools; open and read every source you cite, do not cite from search snippets alone. Prefer primary sources (official docs, papers, filings, maintainers) and note publication dates. Write the report to $report in Markdown with these sections in order: '## Executive summary' (at most 12 lines, every claim numbered-cited), '## Findings' (one subsection per brief question), '## Disagreements and uncertainty', '## Open questions', '## Sources' (numbered list: [n] title, publisher, date, full URL). Cite inline as [n]. Mark each finding's confidence as (high|medium|low). Modify no other file. Final reply: the short report format, with FILES listing $report.")
+round=0
+mark research running
+
+out=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo "You are a research agent. Read the research brief at $brief first; it is your complete requirements. Use your web search and URL reading tools; open and read every source you cite, do not cite from search snippets alone. Prefer primary sources (official docs, papers, filings, maintainers) and note publication dates. Write the report to $report in Markdown with these sections in order: '## Executive summary' (at most 12 lines, every claim numbered-cited), '## Findings' (one subsection per brief question), '## Disagreements and uncertainty', '## Open questions', '## Sources' (numbered list: [n] title, publisher, date, full URL). Cite inline as [n]. Mark each finding's confidence as (high|medium|low). Modify no other file. Final reply: the short report format, with FILES listing $report.")
 res=$(conv_of "$out")
+tally "$out"
+mark research running
+
 if [ -n "$res" ] && grep -q '^DENIED:' <<<"$out"; then
-  out=$(gdo -c "$res" "Your last tool call was denied by permissions and stopped the run. Do not retry it. Continue with web search, URL reading and the file tools only, finish $report, then give the short final reply.")
+  out=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo -c "$res" "Your last tool call was denied by permissions and stopped the run. Do not retry it. Continue with web search, URL reading and the file tools only, finish $report, then give the short final reply.")
+  tally "$out"
+  mark research running
 fi
 if [ -z "$res" ] || [ ! -s "$report" ]; then
+  mark research fail
   summary "RESEARCHER_NOT_DONE"; grep -E '^(STATUS|NOTES|DENIED)' <<<"$out" | head -6; exit 1
 fi
 
 while :; do
+  mark factcheck running
   rm -f "$check"
-  gdo "You are an independent fact-checker. Modify no file except $check. Read the brief $brief and the report $report. For every numbered source, open the URL yourself and check that it exists and actually supports each sentence citing it. Also flag brief questions the report does not answer. Write $check: first line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then one issue per line as '[Unsupported] claim excerpt - source [n] - what the source actually says', '[Wrong] ...', '[Dead] [n] URL - status', or '[Gap] brief question not answered'. PASS only if there are no Unsupported, Wrong, Dead or Gap issues." >/dev/null
+  fc_out=$(GDO_STATUS_DIR='' GDO_TITLE="$name-check" gdo "You are an independent fact-checker. Modify no file except $check. Read the brief $brief and the report $report. For every numbered source, open the URL yourself and check that it exists and actually supports each sentence citing it. Also flag brief questions the report does not answer. Write $check: first line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then one issue per line as '[Unsupported] claim excerpt - source [n] - what the source actually says', '[Wrong] ...', '[Dead] [n] URL - status', or '[Gap] brief question not answered'. PASS only if there are no Unsupported, Wrong, Dead or Gap issues.")
+  tally "$fc_out"
   verdict=$(head -1 "$check" 2>/dev/null)
-  [ "$verdict" = "VERDICT: PASS" ] && { summary "PASS"; exit 0; }
-  [ "$round" -ge "$rounds" ] && { summary "FAIL (${verdict:-no fact-check written})"; exit 1; }
+  [ "$verdict" = "VERDICT: PASS" ] && { mark factcheck pass; summary "PASS"; exit 0; }
+  [ "$round" -ge "$rounds" ] && { mark factcheck fail; summary "FAIL (${verdict:-no fact-check written})"; exit 1; }
   round=$((round + 1))
-  gdo -c "$res" "Fact-check round $round failed. Issues: $check. Fix every issue in $report: replace or remove unsupported claims, correct wrong ones, replace dead sources, answer gaps with new research. Keep the same section structure." >/dev/null
+  mark "fix $round" running
+  fix_out=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo -c "$res" "Fact-check round $round failed. Issues: $check. Fix every issue in $report: replace or remove unsupported claims, correct wrong ones, replace dead sources, answer gaps with new research. Keep the same section structure.")
+  tally "$fix_out"
 done

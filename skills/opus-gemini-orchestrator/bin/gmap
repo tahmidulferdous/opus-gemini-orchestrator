@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# bin/gmap — live agent map reader for Gemini workers
+# Reads $GDO_STATUS_DIR/*.status and renders a live dashboard.
+# No LLM calls, no network, pure bash + coreutils + awk.
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage: gmap [-1] [-h]
+
+Live agent map viewer.
+
+Options:
+  -1    render once and exit 0
+  -h    show this help message and exit 0
+
+Environment:
+  GDO_STATUS_DIR    Directory containing *.status files (default: ${GDO_LOG_DIR:-$HOME/.cache/gdo}/status)
+  GMAP_INTERVAL     Redraw interval in seconds (default: 2)
+  GDO_MODEL         Model name for header (default: gemini-3.8-flash-high)
+  NO_COLOR          Disable colored output
+EOF
+}
+
+once=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -1)
+      once=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "gmap: unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+STATUS_DIR="${GDO_STATUS_DIR:-${GDO_LOG_DIR:-$HOME/.cache/gdo}/status}"
+INTERVAL="${GMAP_INTERVAL:-2}"
+MODEL="${GDO_MODEL:-gemini-3.8-flash-high}"
+
+use_color=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  use_color=1
+fi
+
+render() {
+  local now
+  now=$(date +%s)
+
+  if [ ! -d "$STATUS_DIR" ]; then
+    printf "\n no workers\n"
+    return 0
+  fi
+
+  shopt -s nullglob
+  local files=("$STATUS_DIR"/*.status)
+  shopt -u nullglob
+
+  if [ ${#files[@]} -eq 0 ]; then
+    printf "\n no workers\n"
+    return 0
+  fi
+
+  # Read each file ensuring newline separation, filter valid 8-field records,
+  # sort by start_epoch (field 4) ascending, and render with awk.
+  for f in "${files[@]}"; do
+    [ -f "$f" ] && cat "$f" 2>/dev/null && echo ""
+  done | LC_ALL=C awk -F'|' 'NF == 8 && ($3 == "running" || $3 == "pass" || $3 == "fail") && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ { sub(/\r$/, ""); print }' \
+       | LC_ALL=C sort -t'|' -k4,4n -k1,1 \
+       | LC_ALL=C awk -F'|' -v now="$now" -v model="$MODEL" -v use_color="$use_color" '
+BEGIN {
+    count = 0;
+    max_name_len = 0;
+    running_count = 0;
+    done_count = 0;
+    total_tokens = 0;
+}
+{
+    names[count] = $1;
+    phases[count] = $2;
+    states[count] = $3;
+    start_epochs[count] = $4 + 0;
+    update_epochs[count] = $5 + 0;
+    tokens[count] = $6 + 0;
+    costs[count] = $7 + 0;
+    conversation_ids[count] = $8;
+
+    len = length($1);
+    if (len > max_name_len) {
+        max_name_len = len;
+    }
+    count++;
+}
+END {
+    if (count == 0) {
+        printf "\n no workers\n";
+        exit 0;
+    }
+
+    name_width = (max_name_len > 12) ? max_name_len : 12;
+
+    for (i = 0; i < count; i++) {
+        stale[i] = 0;
+
+        if (states[i] == "running") {
+            age = now - update_epochs[i];
+            if (age > 600) {
+                stale[i] = 1;
+                phase_disp[i] = phases[i] " stale";
+            } else {
+                running_count++;
+                phase_disp[i] = phases[i];
+            }
+            elapsed = now - start_epochs[i];
+        } else {
+            done_count++;
+            phase_disp[i] = "";
+            elapsed = update_epochs[i] - start_epochs[i];
+        }
+
+        if (elapsed < 0) elapsed = 0;
+
+        if (elapsed < 3600) {
+            m = int(elapsed / 60);
+            s = int(elapsed % 60);
+            elapsed_disp[i] = sprintf("%dm%02ds", m, s);
+        } else {
+            h = int(elapsed / 3600);
+            m = int((elapsed % 3600) / 60);
+            elapsed_disp[i] = sprintf("%dh%02dm", h, m);
+        }
+
+        tok = tokens[i];
+        total_tokens += tok;
+        if (tok >= 1000) {
+            tok_disp[i] = sprintf("%.1fk", tok / 1000);
+        } else {
+            tok_disp[i] = sprintf("%d", tok);
+        }
+    }
+
+    # Format header counts
+    if (running_count > 0 && done_count > 0) {
+        counts_str = sprintf("%d running · %d done", running_count, done_count);
+    } else if (running_count > 0) {
+        counts_str = sprintf("%d running", running_count);
+    } else if (done_count > 0) {
+        counts_str = sprintf("%d done", done_count);
+    } else {
+        counts_str = sprintf("%d workers", count);
+    }
+
+    printf "\n";
+    printf " Agent map · %s · %s\n", counts_str, model;
+
+    for (i = 0; i < count; i++) {
+        marker = "";
+        prefix = "";
+        suffix = "";
+
+        if (states[i] == "running") {
+            if (stale[i] == 1) {
+                if (use_color == 1) {
+                    prefix = "\033[2m";
+                    suffix = "\033[0m";
+                }
+                marker = "●";
+            } else {
+                if (use_color == 1) {
+                    marker = "\033[32m●\033[0m";
+                } else {
+                    marker = "●";
+                }
+            }
+        } else if (states[i] == "pass") {
+            if (use_color == 1) {
+                marker = "\033[32m○\033[0m";
+            } else {
+                marker = "○";
+            }
+        } else if (states[i] == "fail") {
+            if (use_color == 1) {
+                marker = "\033[31m✗\033[0m";
+            } else {
+                marker = "✗";
+            }
+        }
+
+        if (phase_disp[i] != "") {
+            printf "%s %s %-*s %-6s %7s tok   %s%s\n", prefix, marker, name_width, names[i], elapsed_disp[i], tok_disp[i], phase_disp[i], suffix;
+        } else {
+            printf "%s %s %-*s %-6s %7s tok%s\n", prefix, marker, name_width, names[i], elapsed_disp[i], tok_disp[i], suffix;
+        }
+    }
+
+    if (total_tokens >= 1000) {
+        total_tok_str = sprintf("%.1fk", total_tokens / 1000);
+    } else {
+        total_tok_str = sprintf("%d", total_tokens);
+    }
+
+    printf " total %s tok · %d workers\n", total_tok_str, count;
+}
+'
+}
+
+if [ "$once" -eq 1 ]; then
+  render
+  exit 0
+fi
+
+trap 'exit 0' INT TERM
+
+while true; do
+  if [ "$use_color" -eq 1 ]; then
+    printf '\033[H\033[J'
+  fi
+  render
+  sleep "$INTERVAL"
+done

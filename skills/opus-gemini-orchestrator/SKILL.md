@@ -38,11 +38,12 @@ In `bin/`, linked into `~/.local/bin` by `scripts/install.sh`. Run from the proj
 | `gdo -l` | this folder's agy conversations (headless `/resume`) | id, title, steps |
 | `gtask <brief>` | implement, run `Verify:`, fresh-Gemini review, max 2 fix rounds | verdict, test tail, diff stat, Critical/Important |
 | `gresearch <brief>` | web research, fresh-Gemini checks every URL, max 2 fix rounds | verdict, sources, unsupported claims, executive summary |
+| `gmap [-1]` | live agent map from local status files, no LLM calls | marker, name, elapsed, tokens, phase per worker |
 
 - Non-zero exit on any failure, including permission soft-denials agy reports as success.
 - Env: `GDO_MODEL` (`gemini-3.8-flash-high`; use `gemini-3.1-pro-high` for hard reasoning),
   `GDO_EFFORT` (`high`), `GDO_TIMEOUT` (`20m`), `GTASK_ROUNDS`, `GRESEARCH_ROUNDS` (`2`).
-- Always `run_in_background: true`. Parallel workers in ONE background call
+- Always `run_in_background: true`. `gmap -1` answers "what is running now" without waking a worker. Parallel workers in ONE background call
   (`gtask a.md & gtask b.md & wait`): one wake-up, not one per worker. Never poll.
 - Each Gemini call costs about a minute and ~27k Gemini tokens of fixed overhead: batch small
   same-shape edits into one task instead of many calls.
@@ -113,6 +114,9 @@ place: parallel Agent calls in one message, feedback via `SendMessage`, same
 - agy headless rejects compound shell lines (`a | b`, `a && b`, `>`): keep `Verify:` for the
   scripts to run, not for Gemini.
 - Never test the tools with dummy tasks inside a real project: they do real work.
+- A task that edits `gdo`/`gtask`/`gresearch` themselves must not run through `gtask`: bash re-reads
+  a running script, so a half-written file breaks the run in progress. Use a plain `gdo` call and
+  verify by hand.
 - Never continue an agy conversation the user started unless asked.
 - Executors never commit, push or reset. Opus commits only when the user asks.
 

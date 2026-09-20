@@ -23,6 +23,26 @@ verify=$(sed -n 's/^Verify:[[:space:]]*//p' "$brief" | head -1)
 read -ra filearr <<<"$files"
 report="$dir/$name.report.md" review="$dir/$name.review.md" tests="$dir/$name.tests.txt" pkg="$dir/$name.diff"
 
+# Live agent map: one status record per task, rendered by gmap (omap pointed at this dir).
+STATUS_DIR="${GDO_STATUS_DIR-${GDO_LOG_DIR:-$HOME/.cache/gdo}/status}"
+if [ -n "$STATUS_DIR" ] && [ -d "$STATUS_DIR" ]; then
+  now="$(date +%s)"
+  for f in "$STATUS_DIR"/*.status; do   # drop records older than a day
+    [ -f "$f" ] || continue
+    u=$(cut -d'|' -f5 "$f" 2>/dev/null || true)
+    [[ "$u" =~ ^[0-9]+$ ]] && [ $(( now - u )) -gt 86400 ] && rm -f "$f"
+  done
+fi
+[ -n "$STATUS_DIR" ] && mkdir -p "$STATUS_DIR"
+start_epoch=$(date +%s) gtokens=0
+mark() {   # mark <phase> <state>; Gemini reports no cost, so the cost field stays 0
+  [ -n "$STATUS_DIR" ] || return 0
+  local tmp; tmp="$(mktemp "$STATUS_DIR/.$name.status.tmp.XXXXXX")"
+  printf '%s|%s|%s|%s|%s|%s|0|%s\n' "$name" "$1" "$2" "$start_epoch" "$(date +%s)" "$gtokens" "$impl" >"$tmp"
+  mv -f "$tmp" "$STATUS_DIR/$name.status"
+}
+tally() { local t; t=$(sed -n 's/.*tokens=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1); [ -n "$t" ] && gtokens=$((gtokens + t)); }
+
 # Snapshot the working tree as a git tree object via a throwaway index: no commits, real index untouched.
 snap() {
   local idx; idx="$(mktemp -u)"
@@ -41,25 +61,34 @@ summary() {
 
 base=$(snap)
 round=0 tc='' impl=''
+mark implement running
 
-out=$(gdo "Read the task brief at $brief first; it is your complete requirements. Touch only these files: $files. Other workers may be editing other files at the same time; ignore them. When done, write a full report (what you built, decisions, how you tested) to $report, then give the short final reply.")
+out=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo "Read the task brief at $brief first; it is your complete requirements. Touch only these files: $files. Other workers may be editing other files at the same time; ignore them. When done, write a full report (what you built, decisions, how you tested) to $report, then give the short final reply.")
 impl=$(conv_of "$out")
+tally "$out"
+mark implement running
 # Mechanical recovery: a soft-denied tool kills the run; resume once, steering around it.
 if [ -n "$impl" ] && grep -q '^DENIED:' <<<"$out"; then
-  out=$(gdo -c "$impl" "Your last tool call was denied by permissions and stopped the run. Do not retry it or anything similar. Continue the task using only the file tools and the Verify command from the brief, write the report, then give the short final reply.")
+  out=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo -c "$impl" "Your last tool call was denied by permissions and stopped the run. Do not retry it or anything similar. Continue the task using only the file tools and the Verify command from the brief, write the report, then give the short final reply.")
+  tally "$out"
 fi
 if [ -z "$impl" ] || ! grep -q 'STATUS: DONE' <<<"$out"; then
+  mark implement fail
   summary "IMPLEMENTER_NOT_DONE"; grep -E '^(STATUS|NOTES|DENIED)' <<<"$out" | head -6; exit 1
 fi
 
 while :; do
+  mark review running
   bash -c "$verify" >"$tests" 2>&1; tc=$?
   git diff "$base" "$(snap)" -- "${filearr[@]}" >"$pkg"
   rm -f "$review"
-  gdo "You are a read-only code reviewer. Modify no file except $review. Read: the task brief $brief, the implementer report $report, the diff $pkg, and the test output $tests (the test command exited $tc). Check spec compliance (every requirement in the brief met, nothing extra built) and quality (correctness bugs, unhandled edge cases, tests that assert nothing or do not cover the brief). Write $review: first line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then one finding per line as '[Critical] file:line - problem - fix' (or [Important] / [Minor]). PASS only if the test command exited 0 and there are no Critical or Important findings." >/dev/null
+  rev=$(GDO_STATUS_DIR='' GDO_TITLE="$name-review" gdo "You are a read-only code reviewer. Modify no file except $review, and run NO shell commands at all (headless permissions deny most of them and that kills your run): use only the file reading tools. Read: the task brief $brief, the implementer report $report, the diff $pkg, and the test output $tests (the test command exited $tc). Check spec compliance (every requirement in the brief met, nothing extra built) and quality (correctness bugs, unhandled edge cases, tests that assert nothing or do not cover the brief). Write $review: first line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then one finding per line as '[Critical] file:line - problem - fix' (or [Important] / [Minor]). PASS only if the test command exited 0 and there are no Critical or Important findings.")
+  tally "$rev"
   verdict=$(head -1 "$review" 2>/dev/null)
-  [ "$verdict" = "VERDICT: PASS" ] && { summary "PASS"; exit 0; }
-  [ "$round" -ge "$rounds" ] && { summary "FAIL (${verdict:-no review written})"; exit 1; }
+  [ "$verdict" = "VERDICT: PASS" ] && { mark review pass; summary "PASS"; exit 0; }
+  [ "$round" -ge "$rounds" ] && { mark review fail; summary "FAIL (${verdict:-no review written})"; exit 1; }
   round=$((round + 1))
-  gdo -c "$impl" "Review round $round failed. Findings: $review. Test output: $tests (exit $tc). Fix every Critical and Important finding and any test failure, touching only $files. Append a fix report to $report." >/dev/null
+  mark "fix $round" running
+  fix=$(GDO_STATUS_DIR='' GDO_TITLE="$name" gdo -c "$impl" "Review round $round failed. Findings: $review. Test output: $tests (exit $tc). Fix every Critical and Important finding and any test failure, touching only $files. Append a fix report to $report.")
+  tally "$fix"
 done

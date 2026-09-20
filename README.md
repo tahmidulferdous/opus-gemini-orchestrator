@@ -1,5 +1,7 @@
 # opus-gemini-orchestrator
 
+![Opus plans, Gemini builds](assets/banner.png)
+
 Claude Opus plans and verifies, Gemini (Antigravity CLI) writes the code, tests, reviews and research, to spend less Claude usage without lowering quality.
 
 [![CI](https://github.com/tahmidulferdous/opus-gemini-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/tahmidulferdous/opus-gemini-orchestrator/actions/workflows/ci.yml)
@@ -106,6 +108,7 @@ bash ~/.claude/skills/opus-gemini-orchestrator/scripts/install.sh --uninstall
 | `gdo -l` | this folder's agy conversations (headless `/resume`) | id, title, steps, time |
 | `gtask <brief.md>` | implement, run `Verify:`, fresh-Gemini review, up to 2 fix rounds | verdict, test tail, diff stat, Critical/Important findings |
 | `gresearch <brief.md>` | research with web tools, fresh-Gemini fact-check of every URL, up to 2 fix rounds | verdict, source count, unsupported claims, executive summary |
+| `gmap` | live agent map of the running and finished workers, reads local status files only (no LLM calls) | one row per worker: marker, name, elapsed, tokens, phase |
 
 ### Environment variables
 
@@ -114,6 +117,21 @@ bash ~/.claude/skills/opus-gemini-orchestrator/scripts/install.sh --uninstall
 - `GDO_TIMEOUT`: default `20m`
 - `GTASK_ROUNDS`: default `2`
 - `GRESEARCH_ROUNDS`: default `2`
+
+## Watching the workers
+
+```
+$ gmap
+ Agent map · 2 running · 1 done · gemini-3.8-flash-high
+ ● task-readme    4m12s    1.2k tok   review
+ ● task-tests     0m45s     340 tok   implement
+ ○ task-install   8m03s   12.4k tok
+ total 13.9k tok · 3 workers
+```
+
+`gmap` redraws every 2 seconds (`GMAP_INTERVAL`), `gmap -1` prints once. It reads only the status
+files the tools write under `~/.cache/gdo/status`, so it costs nothing to run. A worker whose
+status has not changed for 10 minutes is dimmed and marked stale.
 
 ## Example run
 

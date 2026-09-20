@@ -27,6 +27,59 @@ if [ "${1:-}" = "-c" ]; then conv=(--conversation "$2"); shift 2; fi
 task="${*:-$(cat)}"
 [ -z "$task" ] && { echo "gdo: empty task" >&2; exit 2; }
 
+GDO_LOG_DIR="${GDO_LOG_DIR:-$HOME/.cache/gdo}"
+GDO_STATUS_DIR="${GDO_STATUS_DIR-$GDO_LOG_DIR/status}"
+
+# Prune status files older than 86400s based on update_epoch (field 5)
+if [ -n "$GDO_STATUS_DIR" ] && [ -d "$GDO_STATUS_DIR" ]; then
+  now="$(date +%s)"
+  for sf in "$GDO_STATUS_DIR"/*.status; do
+    [ -f "$sf" ] || continue
+    line="$(head -n 1 "$sf" 2>/dev/null || true)"
+    [ -n "$line" ] || continue
+    uepoch="$(printf '%s' "$line" | cut -d'|' -f5)"
+    if [[ "$uepoch" =~ ^[0-9]+$ ]] && [ $(( now - uepoch )) -gt 86400 ]; then
+      rm -f "$sf"
+    fi
+  done
+fi
+
+if [ -n "$GDO_STATUS_DIR" ]; then
+  mkdir -p "$GDO_STATUS_DIR"
+fi
+
+if [ -n "${GDO_TITLE:-}" ]; then
+  raw_title="$GDO_TITLE"
+else
+  raw_title="$(printf '%s' "$task" | tr '\r\n' '  ' | cut -c1-24)"
+fi
+status_name="$(printf '%s' "$raw_title" | tr '|\r\n' '___')"
+safe_title="$(printf '%s' "$raw_title" | tr '/|\r\n' '____')"
+status_file=""
+if [ -n "$GDO_STATUS_DIR" ]; then
+  status_file="$GDO_STATUS_DIR/${safe_title}.status"
+fi
+
+start_epoch="$(date +%s)"
+
+write_status() {
+  [ -n "$GDO_STATUS_DIR" ] || return 0
+  local phase="$1"
+  local state="$2"
+  local tokens="$3"
+  local cost="$4"
+  local sess_id="$5"
+  local update_epoch
+  update_epoch="$(date +%s)"
+  local tmp_file
+  tmp_file="$(mktemp "$GDO_STATUS_DIR/status.tmp.XXXXXX")"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status_name" "$phase" "$state" "$start_epoch" "$update_epoch" "$tokens" "$cost" "$sess_id" > "$tmp_file"
+  mv -f "$tmp_file" "$status_file"
+}
+
+write_status "call" "running" 0 0 ""
+
 contract='You are an executor subagent. An orchestrator (Claude Opus) planned this task and will review your work with git diff and by running checks.
 Rules:
 - Do exactly the task. No scope expansion, no unrelated refactors, no new dependencies unless the task says so.
@@ -48,7 +101,7 @@ TASK:
 contract="${contract/__PWD__/$PWD}"
 [ ${#conv[@]} -gt 0 ] && contract=''   # follow-ups reuse the conversation that already has the contract
 
-log="$HOME/.cache/gdo/$(date +%Y%m%d-%H%M%S)-$$"
+log="$GDO_LOG_DIR/$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$(dirname "$log")"
 
 # agy's workspace is NOT the shell cwd (it defaults to its own scratch dir), so pass the project in.
@@ -58,11 +111,19 @@ rc=$?
 
 status=$(jq -r '.status // "NO_JSON"' "$log.json" 2>/dev/null || echo NO_JSON)
 response=$(jq -r '.response // ""' "$log.json" 2>/dev/null)
-echo "gdo status=$status exit=$rc conversation=$(jq -r '.conversation_id // "-"' "$log.json" 2>/dev/null) log=$log"
+tokens=$(jq -r '.usage.total_tokens // 0' "$log.json" 2>/dev/null || echo 0)
+echo "gdo status=$status exit=$rc conversation=$(jq -r '.conversation_id // "-"' "$log.json" 2>/dev/null) tokens=$tokens log=$log"
 # Headless mode soft-denies unapproved tools and still reports SUCCESS; surface that.
 denied=$(grep -iE 'auto-denied|permission' "$log.err" | head -3)
 [ -n "$denied" ] && echo "DENIED: $denied"
 printf '%s\n' "$response"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git status --short | head -30
 
-[ "$status" = SUCCESS ] && [ $rc -eq 0 ] && [ -z "$denied" ] && [ -n "$response" ] || exit 1
+conv_id=$(jq -r '.conversation_id // ""' "$log.json" 2>/dev/null || true)
+if [ "$status" = SUCCESS ] && [ $rc -eq 0 ] && [ -z "$denied" ] && [ -n "$response" ]; then
+  write_status "call" "pass" "$tokens" 0 "$conv_id"
+  exit 0
+else
+  write_status "call" "fail" "$tokens" 0 "$conv_id"
+  exit 1
+fi
